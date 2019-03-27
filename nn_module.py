@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.init import xavier_normal_, kaiming_normal_, orthogonal_
 
 
@@ -58,10 +59,44 @@ class LayerNorm(nn.Module):
         return x
 
 
+class AdaptiveInstanceNorm2d(nn.Module):
+    def __init__(self, num_features, eps=1e-5, momentum=0.1):
+        super(AdaptiveInstanceNorm2d, self).__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.momentum = momentum
+
+        self.weight = None
+        self.bias = None
+
+        self.register_buffer('running_mean', torch.zeros(num_features))
+        self.register_buffer('running_var', torch.zeros(num_features))
+
+    def forward(self, x):
+        assert self.weight is not None and self.bias is not None
+        b, c, h, w = x.shape
+        running_mean = self.running_mean.repeat(b)
+        running_var = self.running_var.repeat(b)
+
+        x_reshape = x.contiguous().view(1, b*c, h, w)
+        output = F.batch_norm(
+            x_reshape, running_mean, running_var, self.weight, self.bias,
+            True, self.momentum, self.eps
+        )
+
+        return output.view(b, c, h, w)
+
+
 def sequential_pack(layers):
     assert isinstance(layers, list)
     seq = nn.Sequential(*layers)
-    seq.out_channels = layers[0].out_channels
+    for item in layers:
+        if isinstance(item, nn.Conv2d) or isinstance(item, nn.ConvTranspose2d):
+            seq.out_channels = item.out_channels
+            break
+        elif isinstance(item, nn.Conv1d):
+            seq.out_channels = item.out_channels
+            break
     return seq
 
 
@@ -117,12 +152,21 @@ def conv2d_block(in_channels,
                  dilation=1,
                  groups=1,
                  init_type=None,
+                 pad_type='zero',
                  activation=None,
                  norm_type=None):
     # conv2d + norm + activation
     block = []
+    if pad_type == 'zero':
+        block.append(nn.ZeroPad2d(padding))
+    elif pad_type == 'reflect':
+        block.append(nn.ReflectionPad2d(padding))
+    elif pad_type == 'replicate':
+        block.append(nn.ReplicatePad2d(padding))
+    else:
+        raise ValueError
     block.append(nn.Conv2d(in_channels, out_channels,
-                           kernel_size, stride, padding, dilation, groups))
+                           kernel_size, stride, padding=0, dilation=dilation, groups=groups))
     weight_init_(block[-1].weight, init_type, activation)
     if norm_type is None:
         pass
@@ -132,6 +176,8 @@ def conv2d_block(in_channels,
         block.append(nn.InstanceNorm2d(out_channels, affine=True))
     elif norm_type == 'LN':
         block.append(LayerNorm(out_channels, affine=True))
+    elif norm_type == 'AdaptiveIN':
+        block.append(AdaptiveInstanceNorm2d(out_channels))
     else:
         raise ValueError
     if activation is not None:
@@ -148,16 +194,25 @@ def deconv2d_block_bn(in_channels,
                       dilation=1,
                       groups=1,
                       init_type=None,
+                      pad_type='zero',
                       activation=None,
                       use_batchnorm=False):
     # transpose conv2d + bn + activation
     block = []
+    if pad_type == 'zero':
+        block.append(nn.ZeroPad2d(padding))
+    elif pad_type == 'reflect':
+        block.append(nn.ReflectionPad2d(padding))
+    elif pad_type == 'replicate':
+        block.append(nn.ReplicatePad2d(padding))
+    else:
+        raise ValueError
     block.append(nn.ConvTranspose2d(
         in_channels=in_channels,
         out_channels=out_channels,
         kernel_size=kernel_size,
         stride=stride,
-        padding=padding,
+        padding=0,
         output_padding=output_padding,
         groups=groups
     ))
@@ -178,16 +233,25 @@ def deconv2d_block(in_channels,
                    dilation=1,
                    groups=1,
                    init_type=None,
+                   pad_type='zero',
                    activation=None,
                    norm_type=None):
     # transpose conv2d + norm + activation
     block = []
+    if pad_type == 'zero':
+        block.append(nn.ZeroPad2d(padding))
+    elif pad_type == 'reflect':
+        block.append(nn.ReflectionPad2d(padding))
+    elif pad_type == 'replicate':
+        block.append(nn.ReplicatePad2d(padding))
+    else:
+        raise ValueError
     block.append(nn.ConvTranspose2d(
         in_channels=in_channels,
         out_channels=out_channels,
         kernel_size=kernel_size,
         stride=stride,
-        padding=padding,
+        padding=0,
         output_padding=output_padding,
         groups=groups
     ))
@@ -200,6 +264,8 @@ def deconv2d_block(in_channels,
         block.append(nn.InstanceNorm2d(out_channels, affine=True))
     elif norm_type == 'LN':
         block.append(LayerNorm(out_channels, affine=True))
+    elif norm_type == 'AdaptiveIN':
+        block.append(AdaptiveInstanceNorm2d(out_channels))
     else:
         raise ValueError
     if activation is not None:
@@ -211,14 +277,24 @@ def fc_block(in_channels,
              out_channels,
              init_type=None,
              activation=None,
-             use_batchnorm=False,
+             norm_type=None,
              use_dropout=False,
              dropout_probability=0.5):
     block = []
     block.append(nn.Linear(in_channels, out_channels))
     weight_init_(block[-1].weight, init_type, activation)
-    if use_batchnorm:
-        block.append(nn.BatchNorm1d(out_channels))
+    if norm_type is None:
+        pass
+    elif norm_type == 'BN':
+        block.append(nn.BatchNorm2d(out_channels))
+    elif norm_type == 'IN':
+        block.append(nn.InstanceNorm2d(out_channels, affine=True))
+    elif norm_type == 'LN':
+        block.append(LayerNorm(out_channels, affine=True))
+    elif norm_type == 'AdaptiveIN':
+        block.append(AdaptiveInstanceNorm2d(out_channels))
+    else:
+        raise ValueError
     if activation is not None:
         block.append(activation)
     if use_dropout:
@@ -297,3 +373,16 @@ class ResidualBlock(nn.Module):
     def forward(self, x):
         return self.activation(self.block(x) +
                                self.scaling_factor * self.shortcut(x))
+
+
+class ChannelShuffle(nn.Module):
+    def __init__(self, group_num):
+        super(ChannelShuffle, self).__init__()
+        self.group_num = group_num
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        g = self.group_num
+        assert(c % g == 0)
+        x = x.view(b, g, c//g, h, w).permute(0, 2, 1, 3, 4).contiguous().view(b, c, h, w)
+        return x
